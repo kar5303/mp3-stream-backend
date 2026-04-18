@@ -1,63 +1,61 @@
 import os
 import re
 import subprocess
-import tempfile
 from flask import Flask, request, Response, jsonify
-from flask_cors import CORS
 
 app = Flask(__name__)
 
-# 允許你的 GitHub Pages 網域跨域請求
-# 把下面換成你的 GitHub Pages 網址，例如 https://yourname.github.io
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
-CORS(app, origins=ALLOWED_ORIGINS)
+# ── CORS：手動在每個回應加上標頭，確保瀏覽器不擋跨域請求 ──
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return response
 
-
-def is_valid_youtube_url(url: str) -> bool:
-    """只允許合法的 YouTube 網址，防止任意命令注入"""
-    pattern = r'^https?://(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w\-]{11}'
-    return bool(re.match(pattern, url))
-
-
-@app.route("/", methods=["GET"])
+@app.route("/", methods=["GET", "OPTIONS"])
 def index():
     return jsonify({"status": "ok", "message": "MP3 Stream API is running."})
 
 
-@app.route("/stream", methods=["GET"])
+def is_valid_youtube_url(url: str) -> bool:
+    pattern = r'^https?://(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w\-]{11}'
+    return bool(re.match(pattern, url))
+
+
+@app.route("/stream", methods=["GET", "OPTIONS"])
 def stream_mp3():
-    """
-    GET /stream?url=https://www.youtube.com/watch?v=VIDEO_ID
-    以串流方式回傳 MP3 音訊，前端可直接用 <audio src="..."> 播放。
-    """
+    # OPTIONS preflight 直接回 200
+    if request.method == "OPTIONS":
+        return Response(status=200)
+
     url = request.args.get("url", "").strip()
 
     if not url:
         return jsonify({"error": "缺少 url 參數"}), 400
-
     if not is_valid_youtube_url(url):
         return jsonify({"error": "無效的 YouTube 網址"}), 400
 
     def generate():
-        """用 yt-dlp pipe 模式串流輸出音訊，不落地存檔"""
         cmd = [
             "yt-dlp",
             "--no-playlist",
+            "--format", "bestaudio",          # 先抓最佳音訊格式
             "--extract-audio",
             "--audio-format", "mp3",
-            "--audio-quality", "5",      # 0=最佳, 9=最差；5 是平衡點
-            "--output", "-",             # 輸出到 stdout
-            "--quiet",
+            "--audio-quality", "5",
+            "--no-warnings",
+            "--output", "-",                  # 輸出到 stdout
             url,
         ]
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,           # 收集 stderr 方便除錯
         )
         try:
             while True:
-                chunk = process.stdout.read(8192)  # 每次讀 8KB
+                chunk = process.stdout.read(8192)
                 if not chunk:
                     break
                 yield chunk
@@ -65,23 +63,18 @@ def stream_mp3():
             process.stdout.close()
             process.wait()
 
-    return Response(
+    resp = Response(
         generate(),
         mimetype="audio/mpeg",
-        headers={
-            "Content-Disposition": "inline",   # 讓瀏覽器直接播放而非下載
-            "Cache-Control": "no-cache",
-            "X-Content-Type-Options": "nosniff",
-        },
     )
+    resp.headers["Content-Disposition"] = "inline"
+    resp.headers["Cache-Control"]       = "no-cache"
+    resp.headers["X-Accel-Buffering"]   = "no"   # 關閉 nginx 緩衝，讓串流即時送出
+    return resp
 
 
 @app.route("/info", methods=["GET"])
 def get_info():
-    """
-    GET /info?url=...
-    回傳影片標題（供前端顯示用，可選）
-    """
     url = request.args.get("url", "").strip()
     if not url or not is_valid_youtube_url(url):
         return jsonify({"error": "無效網址"}), 400
@@ -95,5 +88,5 @@ def get_info():
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False)
